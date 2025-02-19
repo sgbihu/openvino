@@ -8,26 +8,46 @@
 
 #include "itt.hpp"
 #include "openvino/core/rt_info.hpp"
+#include "openvino/frontend/exception.hpp"
 #include "openvino/op/add.hpp"
+#include "openvino/op/broadcast.hpp"
 #include "openvino/op/concat.hpp"
 #include "openvino/op/constant.hpp"
 #include "openvino/op/convert.hpp"
+#include "openvino/op/convert_like.hpp"
+#include "openvino/op/divide.hpp"
+#include "openvino/op/equal.hpp"
+#include "openvino/op/floor.hpp"
+#include "openvino/op/floor_mod.hpp"
 #include "openvino/op/gather.hpp"
 #include "openvino/op/greater.hpp"
+#include "openvino/op/greater_eq.hpp"
+#include "openvino/op/less.hpp"
+#include "openvino/op/less_eq.hpp"
+#include "openvino/op/log.hpp"
+#include "openvino/op/logical_not.hpp"
+#include "openvino/op/logical_or.hpp"
+#include "openvino/op/matmul.hpp"
+#include "openvino/op/maximum.hpp"
 #include "openvino/op/multiply.hpp"
+#include "openvino/op/negative.hpp"
+#include "openvino/op/pad.hpp"
 #include "openvino/op/range.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/scaled_dot_product_attention.hpp"
 #include "openvino/op/select.hpp"
 #include "openvino/op/shape_of.hpp"
 #include "openvino/op/slice.hpp"
+#include "openvino/op/softmax.hpp"
 #include "openvino/op/split.hpp"
+#include "openvino/op/sqrt.hpp"
+#include "openvino/op/squeeze.hpp"
 #include "openvino/op/subtract.hpp"
 #include "openvino/op/transpose.hpp"
 #include "openvino/op/unsqueeze.hpp"
 #include "openvino/op/variadic_split.hpp"
 #include "openvino/pass/pattern/op/wrap_type.hpp"
-
+#include "transformations/utils/utils.hpp"
 
 namespace ov {
 namespace detail {
@@ -104,17 +124,21 @@ ov::OutputVector ov::pass::GroupQueryAttentionDecomposition::decompose(
     // Only consider batch is 1
     auto seqlens_1d = std::make_shared<v1::Reshape>(real_seqlens, one, false);
     auto past_sequence_length = std::make_shared<v1::Subtract>(seqlens_1d, current_sequence_length);
+    auto seqlens_1d_scalar = std::make_shared<v1::Reshape>(seqlens_1d, one_without_shape, false);  // 12 or 13
+
+    auto past_seq_len_scalar = std::make_shared<v1::Reshape>(past_sequence_length, one_without_shape, false);
     if (do_rotary) {
+        auto current_seqlen_scalar = std::make_shared<v1::Reshape>(current_sequence_length, one_without_shape, false);
         Q = detail::rotaryEmbedding(Q,
                             past_sequence_length,
-                            seqlens_1d,
+                            current_seqlen_scalar,
                             cos_cache.get_node_shared_ptr(),
                             sin_cache.get_node_shared_ptr(),
                             head_size_node,
                             rotary_interleaved);
         K = detail::rotaryEmbedding(K,
                             past_sequence_length,
-                            seqlens_1d,
+                            current_seqlen_scalar,
                             cos_cache.get_node_shared_ptr(),
                             sin_cache.get_node_shared_ptr(),
                             head_size_node,
@@ -124,9 +148,7 @@ ov::OutputVector ov::pass::GroupQueryAttentionDecomposition::decompose(
     // or
     // present = concat(past, K, V)
     auto construct_kv_cache = [&](const ov::Output<ov::Node>& past, const ov::Output<ov::Node>& current) {
-        auto past_datas = std::make_shared<v8::Slice>(past, zero, past_sequence_length, one, two);
-        auto curr_datas = std::make_shared<v8::Slice>(current, zero, current_sequence_length, one, two);
-        return std::make_shared<v0::Concat>(ov::NodeVector{past_datas, curr_datas}, 2);
+        return std::make_shared<v0::Concat>(ov::OutputVector{past, current}, 2);
     };
 
     K = construct_kv_cache(past_key, K);
@@ -155,38 +177,50 @@ ov::OutputVector ov::pass::GroupQueryAttentionDecomposition::decompose(
 
     // need to apply low-triangle mask to attention score.
     // two steps, construct the total_sequence x total_sequence triangle, then slice the current length
-    auto seqlens_1d_scalar = std::make_shared<v1::Reshape>(seqlens_1d, one_without_shape, false);  // 12 or 13
-    std::shared_ptr<ov::Node> mask_per_line_node =
-        std::make_shared<v4::Range>(v0::Constant::create(ov::element::i64, ov::Shape{}, {0}),
-                                    seqlens_1d_scalar,
-                                    one_without_shape,
-                                    ov::element::i64);                            // [0,1,2,...,]
-    auto hori_range = std::make_shared<v0::Unsqueeze>(mask_per_line_node, zero);  // 1x12 or 1x13
-    auto vert_range = std::make_shared<v0::Unsqueeze>(mask_per_line_node, one);   // 12x1 or 13x1
-    auto triu = std::make_shared<v1::Greater>(hori_range, vert_range);            // 12x12 or 13x13
-    auto typed_zero = v0::Constant::create(T, ov::Shape{}, {0});
-    // cf. make_attention_mask@src\plugins\intel_gpu\tests\common\subgraphs_builders.hpp
-    std::shared_ptr<ov::Node> minus_inf = nullptr;
-    if (T == ov::element::f32)
-        minus_inf = ov::op::v0::Constant::create(T, ov::Shape{}, {-std::numeric_limits<float>::infinity()});
-    else if (T == ov::element::f16)
-        minus_inf = ov::op::v0::Constant::create(T, ov::Shape{}, {std::numeric_limits<ov::float16>::lowest()});
-    auto atten_mask = std::make_shared<v1::Select>(triu, minus_inf, typed_zero);  // 12x12 or 13x13
-    auto atten_mask_sliced = std::make_shared<v8::Slice>(atten_mask,
-                                                         past_sequence_length,
-                                                         seqlens_1d,
-                                                         one,
-                                                         zero);  // slice to current query seqlen, 12x12 or 1x13
+    // std::shared_ptr<ov::Node> mask_per_line_node =
+    //     std::make_shared<v4::Range>(v0::Constant::create(ov::element::i64, ov::Shape{}, {0}),
+    //                                 seqlens_1d_scalar,
+    //                                 one_without_shape,
+    //                                 ov::element::i64);                            // [0,1,2,...,]
+    // auto hori_range = std::make_shared<v0::Unsqueeze>(mask_per_line_node, zero);  // 1x12 or 1x13
+    // auto vert_range = std::make_shared<v0::Unsqueeze>(mask_per_line_node, one);   // 12x1 or 13x1
+    // auto triu = std::make_shared<v1::Greater>(hori_range, vert_range);            // 12x12 or 13x13
+    // auto typed_zero = v0::Constant::create(T, ov::Shape{}, {0});
+    // // cf. make_attention_mask@src\plugins\intel_gpu\tests\common\subgraphs_builders.hpp
+    // std::shared_ptr<ov::Node> minus_inf = nullptr;
+    // if (T == ov::element::f32)
+    //     minus_inf = ov::op::v0::Constant::create(T, ov::Shape{}, {-std::numeric_limits<float>::infinity()});
+    // else if (T == ov::element::f16)
+    //     minus_inf = ov::op::v0::Constant::create(T, ov::Shape{}, {std::numeric_limits<ov::float16>::lowest()});
+    // auto atten_mask = std::make_shared<v1::Select>(triu, minus_inf, typed_zero);  // 12x12 or 13x13
+    // auto atten_mask_sliced = std::make_shared<v8::Slice>(atten_mask,
+    //                                                      past_sequence_length,
+    //                                                      seqlens_1d,
+    //                                                      one,
+    //                                                      zero);  // slice to current query seqlen, 12x12 or 1x13
 
-    // compute softmax((Q x K') / sqrt(head_size)) x V
-    std::shared_ptr<ov::Node> qga_output;
-    if (scale != 0.0f) {
-        auto scale_node = v0::Constant::create(T, Shape{}, {scale});
-        qga_output = std::make_shared<v13::ScaledDotProductAttention>(Q, K, V, atten_mask_sliced, scale_node, false);
+    // // compute softmax((Q x K') / sqrt(head_size)) x V
+    // std::shared_ptr<ov::Node> qga_output;
+    // if (scale != 0.0f) {
+    //     auto scale_node = v0::Constant::create(T, Shape{}, {scale});
+    //     qga_output = std::make_shared<v13::ScaledDotProductAttention>(Q, K, V, atten_mask_sliced, scale_node, false);
+    // } else {
+    //     qga_output = std::make_shared<v13::ScaledDotProductAttention>(Q, K, V, atten_mask_sliced, false);
+    // }
+
+    std::shared_ptr<ov::Node> softmax_input = std::make_shared<v0::MatMul>(Q, K, false, true);
+    std::shared_ptr<ov::Node> alpha;
+    if (scale == 0.0f) {
+        alpha = std::make_shared<v0::Sqrt>(head_size_node);
     } else {
-        qga_output = std::make_shared<v13::ScaledDotProductAttention>(Q, K, V, atten_mask_sliced, false);
+        alpha = v0::Constant::create(ov::element::f32, ov::Shape{}, {1.0f / scale});
     }
+    softmax_input = std::make_shared<v1::Divide>(softmax_input, alpha);
 
+    const auto softmax = std::make_shared<v8::Softmax>(softmax_input, 3);
+
+    // softmax((Q x K' + mask) / sqrt(head_size)) x V
+    std::shared_ptr<ov::Node> qga_output = std::make_shared<v0::MatMul>(softmax, V);
     // transpose the result from (batch_size, num_heads, sequence_length, head_size)
     // to (batch_size, sequence_length, num_heads * head_size)
     auto perm = v0::Constant::create(ov::element::i64, ov::Shape{4}, {0, 2, 1, 3});
@@ -233,10 +267,16 @@ std::shared_ptr<ov::Node> rotaryEmbedding(ov::Output<ov::Node> input,
     auto zero = v0::Constant::create(ov::element::i64, ov::Shape{1}, {0});
     auto one = v0::Constant::create(ov::element::i64, ov::Shape{1}, {1});
 
-    auto slice_cache_dim_shape = seqlen_k;
+    auto zero_without_shape = v0::Constant::create(ov::element::i64, ov::Shape{}, {0});
+    auto one_without_shape = v0::Constant::create(ov::element::i64, ov::Shape{}, {1});
+    ov::Output<ov::Node> position_ids = std::make_shared<v4::Range>(zero_without_shape, seqlen_k, one_without_shape, ov::element::i64);
+    position_ids = std::make_shared<v1::Add>(past_seqlen, position_ids);
+    auto cos = std::make_shared<v8::Gather>(cos_cache, position_ids, zero);
+    auto sin = std::make_shared<v8::Gather>(sin_cache, position_ids, zero);
 
-    auto cos = std::make_shared<v8::Slice>(cos_cache, past_seqlen, slice_cache_dim_shape, one, zero);
-    auto sin = std::make_shared<v8::Slice>(sin_cache, past_seqlen, slice_cache_dim_shape, one, zero);
+    // auto slice_cache_dim_shape = seqlen_k;
+    // auto cos = std::make_shared<v8::Slice>(cos_cache, past_seqlen, slice_cache_dim_shape, one, zero);
+    // auto sin = std::make_shared<v8::Slice>(sin_cache, past_seqlen, slice_cache_dim_shape, one, zero);
 
     if (interleaved) {
         auto two = v0::Constant::create(ov::element::i64, ov::Shape{1}, {2});
