@@ -121,14 +121,20 @@ ov::OutputVector ov::pass::GroupQueryAttentionDecomposition::decompose(
 
     ov::Output<ov::Node> present_k;
     ov::Output<ov::Node> present_v;
-    if (!is_static_input) {
+    if (is_static_input) {
+        auto kv_total_seqlen = K.get_partial_shape()[2].get_length();
+        auto kv_total_seqlen_node = v0::Constant::create(ov::element::i64, ov::Shape{1}, {kv_total_seqlen});
+        present_k = register_new_node<v8::Slice>(K, one, kv_total_seqlen_node, one, two);
+        present_v = register_new_node<v8::Slice>(V, one, kv_total_seqlen_node, one, two);
+        // std::cout << "present_k: " << present_k.get_node_shared_ptr()->get_friendly_name() << ": " << present_k.get_partial_shape() << std::endl;
+
+        // const auto positions =
+        //     register_new_node<v4::Range>(one_without_shape, concat_kv_len_scalar, one_without_shape, ov::element::i64);
+        // present_k = register_new_node<v8::Gather>(K, positions, two);
+        // present_v = register_new_node<v8::Gather>(V, positions, two);
+    } else {
         present_k = K;
         present_v = V;
-    } else {
-        const auto positions =
-            register_new_node<v4::Range>(one_without_shape, concat_kv_len_scalar, one_without_shape, ov::element::i64);
-        present_k = register_new_node<v8::Gather>(K, positions, two);
-        present_v = register_new_node<v8::Gather>(V, positions, two);
     }
 
     // Broadcast KV if grouped query attention
