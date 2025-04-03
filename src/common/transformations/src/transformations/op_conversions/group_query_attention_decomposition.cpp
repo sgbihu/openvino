@@ -24,6 +24,7 @@
 #include "openvino/op/shape_of.hpp"
 #include "openvino/op/slice.hpp"
 #include "openvino/op/split.hpp"
+#include "openvino/op/squeeze.hpp"
 #include "openvino/op/subtract.hpp"
 #include "openvino/op/transpose.hpp"
 #include "openvino/op/unsqueeze.hpp"
@@ -91,7 +92,7 @@ ov::OutputVector ov::pass::GroupQueryAttentionDecomposition::decompose(
     // Only consider batch is 1
     const auto seqlens_1d = register_new_node<v1::Reshape>(real_seqlens, one, false);
     const auto past_seqlen = register_new_node<v1::Subtract>(seqlens_1d, current_seqlen);
-    const auto curr_seqlen_scalar = register_new_node<v1::Reshape>(current_seqlen, one_without_shape, false);
+    const auto curr_seqlen_scalar = register_new_node<v0::Squeeze>(current_seqlen);
 
     ov::Output<ov::Node> position_ids =
         register_new_node<v4::Range>(zero_without_shape, curr_seqlen_scalar, one_without_shape, ov::element::i64);
@@ -111,7 +112,7 @@ ov::OutputVector ov::pass::GroupQueryAttentionDecomposition::decompose(
     V = construct_kv_cache(past_value, V);
 
     const auto concat_kv_len = get_dimensions(K.get_node_shared_ptr(), {2});
-    const auto concat_kv_len_scalar = register_new_node<v1::Reshape>(concat_kv_len, one_without_shape, false);
+    const auto concat_kv_len_scalar = register_new_node<v0::Squeeze>(concat_kv_len);
 
     ov::Output<ov::Node> present_k;
     ov::Output<ov::Node> present_v;
