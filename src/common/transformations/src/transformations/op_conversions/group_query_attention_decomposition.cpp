@@ -94,13 +94,13 @@ ov::OutputVector ov::pass::GroupQueryAttentionDecomposition::decompose(
     const auto past_seqlen = register_new_node<v1::Subtract>(seqlens_1d, current_seqlen);
     const auto curr_seqlen_scalar = register_new_node<v0::Squeeze>(current_seqlen);
 
-    ov::Output<ov::Node> position_ids =
-        register_new_node<v4::Range>(zero_without_shape, curr_seqlen_scalar, one_without_shape, ov::element::i64);
-    position_ids = register_new_node<v1::Add>(position_ids, past_seqlen);
-    const auto cos = register_new_node<v8::Gather>(cos_cache, position_ids, zero);
-    const auto sin = register_new_node<v8::Gather>(sin_cache, position_ids, zero);
-
     if (do_rotary) {
+        ov::Output<ov::Node> position_ids =
+            register_new_node<v4::Range>(zero_without_shape, curr_seqlen_scalar, one_without_shape, ov::element::i64);
+        position_ids = register_new_node<v1::Add>(position_ids, past_seqlen);
+
+        const auto cos = register_new_node<v8::Gather>(cos_cache, position_ids, zero);
+        const auto sin = register_new_node<v8::Gather>(sin_cache, position_ids, zero);
         Q = rotaryEmbedding(Q, cos, sin, rotary_interleaved);
         K = rotaryEmbedding(K, cos, sin, rotary_interleaved);
     }
