@@ -1557,6 +1557,36 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
 
         apply_weights_bank_name(lm_head_config, weights_bank_name);
 
+        // PERF: keep the LM-head weights as compile-time constants.
+        //
+        // By default the LM head inherits FUNCALL_FOR_ALL/FOLD/DQ from the common config, so
+        // even though it is a single non-repeated block it still becomes a funcall: its Const
+        // weight/scale/zero-point are lifted into a closure (bank Parameters), and NPUW_DQ's
+        // DQMatMulCWi_Transpose pattern rewrites the dequantize into raw-weight + scale + zp
+        // closure inputs.
+        //
+        // The compiler then cannot take the static path: ConsolidateWeightsDequantization only
+        // folds per-channel scale/zp into a DPU weight table (via staticMatchAndRewrite, no
+        // runtime dequantize at all) when they are Const.  With Parameters it builds an
+        // IE.DynamicDequantizeOp instead, which materializes the full dequantized f16 weight
+        // every inference - for a 151936x2560 u8 vocab projection that is 742 MiB per token.
+        //
+        // Measured on NPU4000 with npu_lm_head_bench (151936x2560, u8, per-channel):
+        //   Const weight/scale/zp  ~6 ms      Parameter weight/scale/zp  ~25 ms
+        // and the shape (2D vs a vestigial 3D group axis) and the explicit weight Transpose
+        // made no measurable difference - only the storage class did.
+        //
+        // Trade-off: the weight moves out of the shared bank and into the LM-head blob, so it
+        // is no longer deduplicated against a tied embedding - budget roughly +weight_size of
+        // memory. Hence opt-in rather than default.
+        if (m_cfg.get<::intel_npu::NPUW_LLM_SHARED_HEAD_KEEP_CONST>()) {
+            LOG_INFO("LM head: keeping weights as Const (disabling FUNCALL_FOR_ALL/FOLD/DQ)");
+            lm_head_config["NPUW_FUNCALL_FOR_ALL"] = "NO";
+            lm_head_config["NPUW_FOLD"] = "NO";
+            lm_head_config["NPUW_DQ"] = "NO";
+            std::cout << "LM head: keeping weights as Const" << std::endl;
+        }
+
         m_lm_head_compiled = m_compiled_model_factory(lm_head_model, plugin, lm_head_config);
         NPUW_ASSERT(m_lm_head_compiled);
     }
@@ -2169,6 +2199,7 @@ void ov::npuw::LLMCompiledModel::implement_properties() {
                           BIND(npuw::llm::min_response_len, NPUW_LLM_MIN_RESPONSE_LEN, get),
                           BIND(npuw::llm::optimize_v_tensors, NPUW_LLM_OPTIMIZE_V_TENSORS, get),
                           BIND(npuw::llm::optimize_lincache_layout, NPUW_LLM_OPTIMIZE_LINCACHE_LAYOUT, get),
+                          BIND(npuw::llm::shared_head_keep_const, NPUW_LLM_SHARED_HEAD_KEEP_CONST, get),
                           BIND(npuw::llm::optimize_fp8, NPUW_LLM_OPTIMIZE_FP8, get),
                           BIND(npuw::llm::cache_rope, NPUW_LLM_CACHE_ROPE, get),
                           BIND(npuw::llm::enable_block_based_kv_cache, NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE, get),
