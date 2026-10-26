@@ -1022,6 +1022,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         LOG_DEBUG("Try patch sliding window attention mask (Phi-3, Gemma-2, Gemma-3, Gemma-4), if it exists.");
         ov::npuw::PatchSlidingWindowMask().run_on_model(kvcache_model);
     }
+
     if (m_cfg.get<::intel_npu::NPUW_LLM_OPTIMIZE_LINCACHE_LAYOUT>()) {
         // Applied once before the prefill model and the generate variants are cloned, so all of
         // them share the conv state layout that the byte-wise present -> past copy relies on.
@@ -1029,10 +1030,6 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
             LOG_DEBUG("Conv state tensors re-laid out as [batch, kernel, channels]");
         }
     }
-    // Decomposed GroupQueryAttention masks only encode causality; make them honour the padded
-    // `attention_mask` input that LLMInferRequest fills for the static KV buffers.
-    LOG_DEBUG("Try rewrite decomposed GroupQueryAttention mask to apply attention_mask, if it exists.");
-    ov::npuw::RewriteGQAAttentionMask().run_on_model(kvcache_model);
 
     LOG_DEBUG("Creating prefill model as clone of transformed kvcache one.");
     auto prefill_model = kvcache_model->clone();
